@@ -1,0 +1,59 @@
+name: QD201 Q1 native scale verification
+on:
+  push:
+    branches: [codex/qd201-q001-a03-x64-verification]
+    paths: [.github/workflows/qd201-q001-a03-x64-verification.yml]
+permissions:
+  contents: read
+jobs:
+  scale:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      FROZEN_ARTIFACT: c3c0cdfbedc7c751c05e8e1d3f26fb7eaa61cc93
+      PLAN_SHA: 65e49eb27cc57ceb77d3dbceb0876c23602ce7e22aab5b27cbe93a8417a57bd3
+      RECORDER_SHA: ee752957486e5076fa68ed7ce401f4aa380407bfd5b28a2fb7c7bf8d19d81ce7
+    steps:
+      - name: Record native x64 verification offline
+        shell: bash
+        run: |
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -sm)" = "Linux x86_64"
+          tmp="$(mktemp -d)"
+          out="$RUNNER_TEMP/qd201-q001-a03-scale"
+          mkdir -p "$tmp/frozen" "$tmp/build" "$tmp/inputs" "$out"
+          git init -q "$tmp/git"
+          git -C "$tmp/git" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$tmp/git" fetch -q --no-tags --depth=1 origin "$FROZEN_ARTIFACT" "$GITHUB_SHA"
+          test "$(git -C "$tmp/git" rev-parse "$FROZEN_ARTIFACT")" = "$FROZEN_ARTIFACT"
+          git -C "$tmp/git" archive "$FROZEN_ARTIFACT" | tar -x -C "$tmp/frozen"
+          git -C "$tmp/git" show "$GITHUB_SHA:.github/verification/qd201-q001/plan.json" > "$tmp/inputs/plan.json"
+          git -C "$tmp/git" show "$GITHUB_SHA:.github/verification/qd201-q001/record_session.py" > "$tmp/build/record_session.py"
+          git -C "$tmp/git" show "$GITHUB_SHA:.github/verification/qd201-q001/Dockerfile" > "$tmp/build/Dockerfile"
+          printf '%s  %s\n' "$PLAN_SHA" "$tmp/inputs/plan.json" "$RECORDER_SHA" "$tmp/build/record_session.py" | sha256sum -c
+          printf 'FROZEN_ARTIFACT=%s PLAN_SHA=%s RECORDER_SHA=%s RUNNER_ARCH=%s RUN_ID=%s\n' "$FROZEN_ARTIFACT" "$PLAN_SHA" "$RECORDER_SHA" "$RUNNER_ARCH" "$GITHUB_RUN_ID"
+          lscpu
+          docker build -q --tag qd201-x64-verifier "$tmp/build"
+          docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' qd201-x64-verifier | tee "$out/image.txt"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' qd201-x64-verifier)" = linux/amd64
+          code=0
+          docker run --rm --init --network none --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL \
+            --security-opt no-new-privileges --pids-limit 256 --memory 2g --cpuset-cpus 0 \
+            --mount "type=bind,src=$tmp/frozen,dst=/workspace/project" \
+            --mount "type=bind,src=$tmp/inputs,dst=/verification-input,readonly" \
+            --mount "type=bind,src=$out,dst=/verification" qd201-x64-verifier || code=$?
+          sudo chown -R "$(id -u):$(id -g)" "$out"
+          cp "$tmp/inputs/plan.json" "$out/plan.json"
+          if test -f "$out/command-001.log"; then cat "$out/command-001.log"; fi
+          test "$code" = 0
+          test -s "$out/recording.mp4"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); c,=d["commands"]; sys.exit(0 if d["ok"] and c["exit_code"]==0 and not c["timed_out"] else 1)' "$out/result.json"
+      - name: Preserve supplemental evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qd201-q001-a03-native-scale
+          path: ${{ runner.temp }}/qd201-q001-a03-scale
+          if-no-files-found: error
+          retention-days: 14
