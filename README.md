@@ -41,6 +41,29 @@ publish("run/another-sample.json", result)
 
 已通过 6 项业务测试，另实际核对已有目标、符号链接目标、JSON重复键、非法业务输入和临时发布文件清理。数值和排序语义见契约，不以文件哈希代替业务结果断言。
 
+## 校准融合 API process_calibrated
+
+设备复位后每道测试只提供若干候选坐标变换时，使用 `wafer_fusion.process_calibrated(data)`。相邻工位的基准点 links（三站有效窗口）约束哪些候选组合构成可行校准；输出每颗裸片在所有可行校准下实际可达的 `possible_statuses`，选片坐标只包含在每种可行校准下都 pass 的裸片。无可行校准或输入非法时抛 `ValueError`。纯离线、标准库实现，不修改入参；字段、判定与排序口径见 [数据契约](docs/contract.md)。
+
+```python
+from wafer_fusion import process_calibrated
+
+result = process_calibrated(payload)
+result["schema"]              # "wafer-calibration-v1"
+result["supported_candidates"]
+result["dies"]                # die_id / at / possible_statuses
+result["pick_coordinates"]
+```
+
+测试均使用合成数据，不操作选片设备：
+
+```sh
+.venv/bin/python -I -m unittest discover -s tests -v
+.venv/bin/python -I tests/scale_regression.py
+```
+
+`tests/scale_regression.py` 按固定验收规格构造 19881 个规范裸片、20 道测试、每道 9801 条读数与 8 个候选、49 条基准 links；构造完毕后仅计 `process_calibrated` 的单进程 CPU 时间（`time.process_time`），预算 30 秒，当前 CPython 3.11 实测约 2 秒，并全量核对支持候选、原点必选、轴向点必 fail 与越界裸片仅 incomplete。另以独立暴力枚举在 700 个随机小案例上逐字段交叉验证（脚本在仓库外的临时验证目录，不属于交付物）。
+
 ## 当前边界与来源
 
 不管理库存、订单、复测时间版本、自动设备控制或统计看板。
