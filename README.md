@@ -158,3 +158,41 @@ ledger.confirm_cleanup("CH", 1)
 ```
 
 字段、额度、封账校验、游标与失败边界见 [数据契约](docs/contract.md)。测试均使用合成数据。
+
+## 双裸片装片批次 API MountingBatch（离线）
+
+`wafer_fusion.MountingBatch` 把晶圆选片数据与工艺分档编成整批 L/R 配组，并管理装片位的领用凭据与报废后的下一轮配组。只处理单个工装批次的数据处理和本地持久化，不控制设备；纯标准库、单写者、不新增运行时第三方依赖，不改变既有公开接口。
+
+```python
+from wafer_fusion import MountingBatch
+
+batch = MountingBatch.create("run/mount-batch-7", {
+    "wafers": [wafer_payload_l, wafer_payload_r],   # 完整 process_calibrated 入参
+    "grading": [
+        {"wafer": "WL1", "at": [0, 0], "side": "L",
+         "source_group": "GL", "coefficient": 0},
+        {"wafer": "WR1", "at": [0, 0], "side": "R",
+         "source_group": "GR", "coefficient": 1}],
+    "positions": ["P1", "P2"],
+    "max_coefficient_diff": 2})
+
+plan = batch.preview_plan()                 # 只读：总差最小、平局按字典序
+credential = batch.issue_credential({       # 仅当该对仍是当前方案配对才签发
+    "request_id": "REQ-1", "position_id": "P1",
+    "pair": {"left": {"wafer": "WL1", "at": [0, 0]},
+             "right": {"wafer": "WR2", "at": [0, 0]}}})
+
+batch.submit_mount_report({                 # 终态：碰胶集合耗用，未碰胶显式退回
+    "credential_id": credential["credential_id"],
+    "outcome": "scrapped",
+    "touched": [{"wafer": "WL1", "at": [0, 0]}],
+    "untouched": [{"wafer": "WR2", "at": [0, 0]}]})
+
+MountingBatch("run/mount-batch-7")          # 下一班重开：状态、凭据、耗用全可查
+```
+
+裸片资格只由既有校准引擎的 `pick_coordinates` 决定，不接收调用方声称的通过标记；分档良好但在某种可行校准下会失败的裸片不参与配组。预览对全部待配组装片位求基数完整、总系数差最小的二分匹配，平局按裸片 `(wafer ID, y, x)` 与配对 `(L, R)` 的字典序裁决，不可补齐时不给任何可领用部分方案。未结凭据锁定两颗裸片；报废碰胶裸片永久耗用，未碰胶裸片经显式确认才回池。状态为目录内单个 `mounting.json`，原子落盘；提交前中断无半次变化，答复丢失可凭原请求重放取回。字段、返回结构与失败边界见 [数据契约](docs/contract.md)，合成验收见 `tests/test_mounting.py`（27 项，含与暴力枚举的随机交叉验证）：
+
+```sh
+.venv/bin/python -I -m unittest discover -s tests -v
+```

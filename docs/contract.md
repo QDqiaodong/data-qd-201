@@ -140,3 +140,68 @@ shot 矩形闭合；一个 shot 完整覆盖某裸片当且仅当裸片闭矩形
 ### 持久化与失败边界
 
 写入沿用档案口径：同目录临时文件 + `fsync` + 原子替换 + 目录 `fsync`；重开时清理遗留临时文件。拒绝或提交前中断不得留下半个包、提前释放额度或提前确认清理；若提交完成但应答丢失，重开后的等价重试仍返回原包。成功写入在重开后可查。本 API 不改变既有校准、档案与复测接口，不提供通用 CLI、界面或设备连接。
+
+## 双裸片装片批次 API MountingBatch（离线持久化）
+
+`wafer_fusion.MountingBatch` 把 1～16 份晶圆的完整 `process_calibrated` 入参与候选裸片工艺分档融合成整批 L/R 配组，并管理装片位的领用凭据、装片回执与报废后的下一轮配组。只处理单个工装批次的数据处理与本地持久化，不控制设备；纯标准库、单写者按序调用，不新增运行时第三方依赖，不修改调用方入参。非法结构、重复、越界与业务冲突一律抛 `ValueError`。既有 API 行为不变。
+
+### 建批 `MountingBatch.create(path, request)` / 重开 `MountingBatch(path)`
+
+`request` 顶层恰含四个字段：
+
+- `wafers`：1～16 份完整校准入参（即 `process_calibrated` 的输入结构，含 `wafer/sites/runs/links`），各份 `wafer` 标识不重复。建批时逐份调用既有校准引擎；裸片资格只来自该引擎给出的 `pick_coordinates`（在每种可行校准下都 pass），不读取、也不接受调用方声称的通过标记，不会只挑一种可行校准替代完整判定。某份入参本身无可行校准或结构非法时整批拒绝。
+- `grading`：0～256 行工艺分档，每行恰含 `wafer`、`at`（规范坐标 [x,y]，分量 ±10000）、`side`（仅 `"L"`/`"R"`）、`source_group`（工艺来源组 ID，沿用 ASCII ID 约定）、`coefficient`（整数，±1,000,000，布尔不算整数）。每个 `(wafer, at)` 至多一行；坐标必须是该片校准入参 `sites` 声明的坐标，否则拒绝。系数在 ±1,000,000 内。
+- `positions`：1～32 个不重复装片位 ID（ASCII ID），按工装声明顺序排列，配组结果按此顺序顺次分配。
+- `max_coefficient_diff`：本批统一最大系数差，0～2,000,000 的整数；系数绝对差等于上限也允许配对。
+
+资格口径：分档行只在其坐标属于该片 `pick_coordinates` 时 `eligible=true`。有分档但未入选片坐标的裸片合法保留在输入里（`eligible=false`），永不参与配组；没有分档的合格裸片同样不参与。分档与校准资格在本批内固定。不同晶圆的同一坐标是不同裸片，身份键为 `(wafer, y, x)`。
+
+批次在独立本地目录创建，目录内单个 `mounting.json`（schema `wafer-mounting-batch-v1`）。目标目录已存在且含本批次状态时，仅当请求等价（重排晶圆列表或分档行不影响等价性，内部按规范顺序签名）才重开返回同一批次；请求不同或目录存在但无状态文件均抛错，绝不覆盖。
+
+### 预览 `preview_plan()`（只读，不写状态、不领料）
+
+对所有「尚未装成、也没有未结领用凭据」的装片位一起配组。已耗用裸片永不回池；未结凭据固定的两颗对其他位置保留、不可被借用。配对条件：一颗 L、一颗 R，`source_group` 不同，且 `|系数差| ≤ max_coefficient_diff`；每颗裸片至多进入一个配对。
+
+返回 schema `wafer-mounting-plan-v1`：
+
+- `complete`：布尔。能补齐全部待配组装片位时为 `true`，否则 `false`。
+- `positions`：本次参与配组的待配组装片位 ID（工装顺序）。
+- `pairs`：排好序的配对列表，每项 `{left, right, coefficient_diff}`，其中 `left/right` 为裸片视图 `{wafer, at, side, source_group, coefficient}`。
+- `assignments`：把 `pairs` 顺次分给 `positions` 的结果，每项 `{position_id, left, right}`。
+- `total_coefficient_diff`：完整方案的系数差总和；不可补齐时为 `null`。
+
+优化口径：先要求覆盖全部待配组装片位的完整方案（基数 k 的二分图匹配），在所有完整方案中取总系数差最小者。并列平局时，每颗裸片按 `(wafer ID, y, x)` 比较、每对按 `(L 裸片, R 裸片)` 比较，在排好序的配对列表之间取字典序最小者，再按工装声明顺序顺次分配。实现把该字典序口径精确编码为整数边权（超递增 2 的幂偏好项），由一次最小费用流求出唯一确定性最优解，不做近似扰动。不可补齐时 `complete=false` 且 `pairs/assignments` 均为空，不返回任何可领用的部分方案；没有待配组装片位时返回空方案（总和 0）。重排晶圆列表与分档行不改变结果。
+
+### 领用凭据 `issue_credential(request)`
+
+`request` 恰含 `request_id`（批内唯一 ASCII ID）、`position_id`、`pair`（`{left, right}`，各为 `{wafer, at}`）。
+
+- 新请求：当且仅当该对仍是该装片位在**当前完整方案**中的配对时签发。预览已失效（裸片被耗用、被其他未结凭据锁定或装片位状态变化）时拒绝，绝不静默改发其他裸片；当前不可补齐、装片位已有未结凭据或已装成终结时同样拒绝。
+- 一次签发只固定该装片位的一对，不固定预览中其余位置；自签发起这两颗被保留，其他请求不得借用。凭据的 `credential_id`（批内单调序号 `C0001…`）、装片位与当时批准的两颗裸片不可变。
+- 同一 `request_id` 携带完全相同的请求体再次调用：取回原凭据，即使它已终结、装片位已补发或当前已不可补齐；这不是重新授权。相同 ID 的不同请求体（不同装片位或不同裸片）拒绝。
+
+返回凭据视图 `{credential_id, serial, request_id, position_id, left, right, state, terminal}`，其中 `state` 为 `"open"`/`"mounted"`/`"scrapped"`，`terminal` 未终结时为 `null`。
+
+### 装片回执 `submit_mount_report(request)`
+
+`request` 恰含 `credential_id`、`outcome`（`"mounted"`/`"scrapped"`）、`touched`（已碰胶面裸片 `{wafer, at}` 列表）、`untouched`（明确确认未碰胶的裸片列表）。回执是终态，两个集合必须完整准确地恰好覆盖凭据中的两颗裸片（不重不漏、不重叠、不得引用凭据外裸片）；现场尚不知道碰胶范围时不应提交，未结凭据与两颗裸片继续保留，不能靠超时或重新预览释放。
+
+- `mounted`：`touched` 须恰为凭据两颗，装片位终结（mounted），两颗耗用。
+- `scrapped`：允许零、一或两颗在 `touched`；所列裸片耗用并永久记入 `consumed`；未列入 `touched` 的裸片当且仅当出现在 `untouched` 中才退回配组池，原装片位重新纳入待配组。报废是实物记录，即使它使剩余装片位无法配齐也照常受理，不拒收、不撤销。
+- 未知凭据、凭据外裸片、集合未覆盖两颗、同颗同时出现在两个集合、mounted 却声明 untouched，以及同一凭据的矛盾终态，一律拒绝。
+- 完全相同的终态回执重复提交（集合顺序不计）取回原确认，不再产生新领用、不改变耗用事实。
+
+返回确认 `{credential_id, request_id, position_id, outcome, touched, untouched, consumed, position_status}`，`position_status` 为 `"mounted"` 或 `"waiting"`。
+
+### 查询（跨班重开后均可调用）
+
+- `positions()`：按工装顺序返回每个装片位 `{position_id, status, open_credential_id, mounted}`，`status` 为 `"waiting"`/`"locked"`（有未结凭据）/`"mounted"`；可据此区分历史凭据与当前未结凭据。
+- `open_credentials()`：当前未结凭据视图列表。
+- `credential_history()`：按签发序号返回全部凭据（含终态），历史与未结可区分。
+- `consumed_dies()`：全部已耗用裸片（含装成与报废碰胶），每项为裸片视图加 `credential_id` 与 `reason`。
+- `preview_plan()`：基于当前未结凭据与已耗用集合的当前方案。
+- `grading_view()`：全部分档行及 `eligible` 标志；`batch_info()`：批次固定信息摘要。所有返回结构均可 JSON 序列化。
+
+### 持久化、原子性与重放
+
+状态写入沿用档案口径：同目录临时文件 + `fsync` + 原子替换 + 目录 `fsync`，重开清理遗留临时文件。签发与配对锁定一起生效；终态确认、已耗用集合与装片位的终结/重新开放在同一次提交内一起生效。提交前中断后重开看不到半次变化；已完整提交但答复丢失时，凭原 `request_id`（领用）或原终态回执（报告）重放即可取回当时的凭据或确认。只支持一个调用方顺序操作，不提供通用 CLI、界面或设备连接。
