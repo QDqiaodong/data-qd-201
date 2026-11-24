@@ -40,6 +40,39 @@ links为0..256条已确认基准点对应，每项恰含 `left`、`right`，两�
 
 重排sites、records、candidates或links不改变输出。小规模结果必须全量核对；`tests/scale_regression.py` 给出可复现的单进程CPU时间规模回归（构造不计入，仅计 `process_calibrated` 调用，预算30秒），运行方式：`python -I tests/scale_regression.py`。
 
+## 曝光图编译 API compile_exposure_map(data)（离线）
+
+`wafer_fusion.compile_exposure_map` 把晶圆几何与逐层曝光记录编译成可直接作为 `process_calibrated` 输入 `sites` 的规范裸片坐标，同时为每个圆内候选保留曝光归属与排除原因。纯标准库、单进程、不连接设备、不引入第三方运行时依赖，不修改入参；非法输入一律抛 `ValueError`。既有 API 行为不变。
+
+### 输入
+
+顶层恰含 `wafer`、`radius`、`die`、`lattice`、`layers`：
+
+- `wafer`：沿用仓库 ASCII ID 约定（`[A-Za-z0-9_:-]{1,64}`）。所有坐标以晶圆中心为原点，单位就是输入给出的整数坐标单位，不做单位换算。
+- `radius`：1..10000 的正整数（布尔不是整数，拒绝）。
+- `die`：恰含正整数 `width`、`height`，各不大于 20000。
+- `lattice`：恰含整数二元数组 `origin`（分量 ±10000）与正整数二元数组 `pitch`（1..10000）。候选中心为 `origin + [i*pitch_x, j*pitch_y]`，i、j 为任意整数；原点、间距与全部生成坐标均落在 ±10000 边界内，越界结构拒绝。
+- `layers`：1..8 个不同层 ID。每层恰含 `id`、`shots`，`shots` 为 1..128 个 shot；每个 shot 恰含层内唯一 `id`（ASCII ID）、`bounds=[min_x,min_y,max_x,max_y]`（四分量均为 ±10000 整数，严格 `min<max`，闭合矩形）和 `state`（仅 `ready`/`hold`）。层 ID、shot ID 重复均拒绝；未知字段、布尔充当整数、错误长度数组一律拒绝。
+
+几何口径：候选只包括中心在圆内或圆周上（`x²+y² ≤ radius²`）的不同网格点，按中心 y 后 x 排序。圆内候选中心上限 100000，超限拒绝（正 pitch 下网格点天然互异，重复结构同样拒绝）。裸片是以候选中心为中心、边平行坐标轴的闭矩形；完整位于晶圆内当且仅当四个角都在圆内或圆周上。宽高允许奇数：全部比较在二倍整数坐标上进行（裸片边为 `2x±width`、`2y±height`，圆判据为 `(2x)²+(2y)² ≤ 4·radius²`），圆周相切判为在内，任何结论都不经过浮点舍入。
+
+### 曝光归属与原因
+
+shot 矩形闭合；一个 shot 完整覆盖某裸片当且仅当裸片闭矩形四边都落在 shot bounds 内（边界相切算覆盖）。shots 数组顺序没有优先级含义：同一裸片在一层被多个 shot 完整覆盖就是归属歧义，输出保留全部匹配 ID，绝不挑第一个、最近者或按 ID 消解。层身份只由层 ID 决定，输出一律按层 ID 排序；shot_ids 按字典序排列。即使裸片被晶圆边缘截断，仍逐shot计算并返回它与每一层的完整覆盖关系。
+
+每个 die 项的 `reasons` 按固定顺序排列：先 `wafer_edge`（裸片任一角在圆外），再按层 ID 排列该层原因——无完整覆盖 shot 为 `{"layer","reason":"uncovered"}`；完整覆盖 shot 多于一个为 `ambiguous`（保留全部 ID）；唯一覆盖 shot 状态为 `hold` 为 `held`（记录该 shot ID 于 exposures）。一层的 hold 只影响实际被该 shot 唯一覆盖的裸片，不牵连同层其他 shot 或其他层；不完整、未覆盖、多重覆盖的位置全部留在 `dies`，不静默丢弃。
+
+### 输出与判定
+
+可 JSON 序列化字典，顶层恰为 `schema`（固定 `wafer-exposure-map-v1`）、`wafer`、`sites`、`dies`：
+
+- `dies`：每个圆内候选中心一项，按 y 后 x 排序，恰含 `at`（二元整数数组）、`status`（`probeable`/`excluded`）、`exposures`（按层 ID 排序，每项恰含 `layer`、`shot_ids`）、`reasons`。
+- 仅当裸片完整位于晶圆内、且每层恰有一个完整覆盖 shot 且这些 shot 全部 `ready` 时为 `probeable`；任一条件不满足为 `excluded`。
+- `sites`：只含 `probeable` 裸片中心，顺序与 `dies` 中对应项一致，可原样作为 `process_calibrated` 的 `sites`（1..20000，超限拒绝）；`sites` 与 `probeable` 判定严格一致。
+- 重排 `layers` 或 `shots` 不改变完整 JSON 结果；输入在成功或拒绝后均不被修改。
+
+`tests/test_exposure.py` 全量核对小晶圆几何（含圆周相切与奇数宽高）、uncovered/ambiguous/held、原因排序、校验与入参不变性，并把 `sites` 接入 `process_calibrated` 验证坐标与顺序；`tests/exposure_scale_regression.py` 按固定规格构造 8 层、每层 128 个 shot、圆内候选 ≥80000 的合成输入，只计 `compile_exposure_map` 的进程 CPU 时间（`time.process_time`），预算 15 秒，全量（不采样、不截断）核对候选条数、`sites` 与 `probeable` 坐标完全相等以及重排不变性，运行方式：`python -I tests/exposure_scale_regression.py`。
+
 ## 复测档案 API WaferArchive（离线持久化）
 
 `wafer_fusion.WaferArchive` 面向跨班次交接：一份本地档案目录只对应一份合法的 `process_calibrated` 首测输入，外加 links 修订史、签发工单与回传报告。纯标准库、单写者、不接设备、不引入第三方运行时依赖；非法业务输入一律抛 `ValueError` 且不修改调用方输入。档案状态为目录内单个 `archive.json`（schema `wafer-archive-v1`），写入采用同目录临时文件 + `fsync` + 原子替换 + 目录 `fsync`；被拒绝的写入或提交前中断不会留下可查询到的半条修订、半份报告或被改变的选片结果，重开时清理遗留临时文件。

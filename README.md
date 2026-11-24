@@ -64,6 +64,29 @@ result["pick_coordinates"]
 
 `tests/scale_regression.py` 按固定验收规格构造 19881 个规范裸片、20 道测试、每道 9801 条读数与 8 个候选、49 条基准 links；构造完毕后仅计 `process_calibrated` 的单进程 CPU 时间（`time.process_time`），预算 30 秒，当前 CPython 3.11 实测约 2 秒，并全量核对支持候选、原点必选、轴向点必 fail 与越界裸片仅 incomplete。另以独立暴力枚举在 700 个随机小案例上逐字段交叉验证（脚本在仓库外的临时验证目录，不属于交付物）。
 
+## 曝光图编译 API compile_exposure_map
+
+晶圆探针测试的 `sites` 不能只靠理想网格：晶圆边缘会截断裸片，各曝光层的步进场区也可能有缺口、重叠或暂时不可用。`wafer_fusion.compile_exposure_map(data)` 把晶圆几何（半径、裸片宽高、网格原点与间距）和逐层曝光 shot 记录编译成规范裸片坐标，纯离线、标准库实现，不接设备、不修改入参。
+
+```python
+from wafer_fusion import compile_exposure_map
+
+result = compile_exposure_map(payload)
+result["schema"]          # "wafer-exposure-map-v1"
+result["sites"]           # 可直接作为 process_calibrated 的 sites
+result["dies"]            # 每个圆内候选：at/status/exposures/reasons
+```
+
+`sites` 只含完整位于晶圆内、且每层恰有一个 `ready` shot 完整覆盖的裸片中心（按 y 后 x，上限 20000）；`dies` 保留全部圆内候选（上限 100000），边缘截断（`wafer_edge`）、未覆盖（`uncovered`）、多重覆盖（`ambiguous`，保留全部 shot ID）与 `held` 原因都不静默丢弃。全部几何在二倍整数坐标上判定，奇数宽高与圆周相切不依赖浮点；重排 layers/shots 不改变结果。字段、原因排序与失败边界见 [数据契约](docs/contract.md)。
+
+```sh
+.venv/bin/python -I -m unittest discover -s tests -v
+.venv/bin/python -I tests/exposure_scale_regression.py
+```
+
+规模回归按固定规格构造 8 层、每层 128 个矩形 shot、87253 个圆内候选的合成输入，只计 `compile_exposure_map` 的单进程 CPU 时间，预算 15 秒，全量核对候选条数、`sites` 与 `probeable` 坐标一致及重排不变性。测试全部使用合成数据，不操作真实设备或生产晶圆数据。
+
+
 ## 复测交接 API WaferArchive
 
 `wafer_fusion.WaferArchive` 把首测证据、links 修订、复测工单与回传报告放进一份可跨班重开的本地档案目录（单文件原子落盘，标准库实现）。整组裸片只有在当前修订的每种完整可行校准下都能被同一组本地落针精确覆盖时才签发；基准点被纠正导致范围无法证明时，整份工单暂停、旧有效行重新露出，证据恢复后自动复用。字段、配额与失败边界见 [数据契约](docs/contract.md)。
