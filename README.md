@@ -111,3 +111,27 @@ archive.history_order("wo-0001")
 不管理库存、订单、复测时间版本、自动设备控制或统计看板。
 
 全部输入样例原创合成，MIT许可，见 [来源](fixtures/SOURCES.md)。仅复用MIT通用构建、字段校验与原子新建IO脚手架；业务实现独立编写。当前精确公共依赖镜像准备查询结果为 `true`；这不影响已通过的宿主离线独立环境验证，也不构成容器验收记录。本次没有构建或启动容器。
+
+## 首测收件账本 FirstTestLedger（离线）
+
+`wafer_fusion.FirstTestLedger` 面向探针台首测交接：设备先把原始读数写入自身缓冲，再分批、乱序经同一通道送来，同一通道可交错混入不同晶圆。账本按源身份 `(stream, seq)` 收件，按片封账成不可变的交接包（完整首测 payload + 逐行血缘），并维护设备唯一接受的通道清理游标。纯标准库、单写者、不接设备；写入沿用档案的临时文件 + `fsync` + 原子替换口径。
+
+```python
+from wafer_fusion import FirstTestLedger
+
+ledger = FirstTestLedger.create("run/ledger", pending_limit=2000)
+ledger.receive([{"stream": "CH", "seq": 1, "wafer": "W", "run": "R0",
+                 "at": [0, 0], "bin": "P"}])
+package = ledger.seal({"wafer": "W", "sites": [[0, 0]],
+                       "runs": [{"id": "R0", "bins": {"P": "pass"},
+                                 "candidates": [{"id": "id", "matrix": [[1, 0], [0, 1]],
+                                                 "offset": [0, 0]}]}],
+                       "links": [],
+                       "sources": {"R0": [{"stream": "CH", "seq": 1}]}})
+package["payload"]            # 可直接交给 WaferArchive.create
+package["lineage"]            # [{run, at, stream, seq}, ...]
+ledger.cleanup_cursor("CH")   # 已进入持久交接包的最大连续前缀
+ledger.confirm_cleanup("CH", 1)
+```
+
+字段、额度、封账校验、游标与失败边界见 [数据契约](docs/contract.md)。测试均使用合成数据。
