@@ -64,6 +64,48 @@ result["pick_coordinates"]
 
 `tests/scale_regression.py` 按固定验收规格构造 19881 个规范裸片、20 道测试、每道 9801 条读数与 8 个候选、49 条基准 links；构造完毕后仅计 `process_calibrated` 的单进程 CPU 时间（`time.process_time`），预算 30 秒，当前 CPython 3.11 实测约 2 秒，并全量核对支持候选、原点必选、轴向点必 fail 与越界裸片仅 incomplete。另以独立暴力枚举在 700 个随机小案例上逐字段交叉验证（脚本在仓库外的临时验证目录，不属于交付物）。
 
+## 复测交接 API WaferArchive
+
+`wafer_fusion.WaferArchive` 把首测证据、links 修订、复测工单与回传报告放进一份可跨班重开的本地档案目录（单文件原子落盘，标准库实现）。整组裸片只有在当前修订的每种完整可行校准下都能被同一组本地落针精确覆盖时才签发；基准点被纠正导致范围无法证明时，整份工单暂停、旧有效行重新露出，证据恢复后自动复用。字段、配额与失败边界见 [数据契约](docs/contract.md)。
+
+```python
+from wafer_fusion import WaferArchive
+
+# 建档（初版修订 ID 由调用方指定）；重开已存在目录用 WaferArchive(path)
+archive = WaferArchive.create("run/wafer-W", payload, revision_id="rev0")
+
+# 提交完整 links 修订；无解修订抛 ValueError，旧版继续有效
+archive.submit_revision("rev1", new_links)
+
+# 签发：批准一组规范裸片，取回可交接的本地落针清单
+order = archive.issue_order({
+    "order_id": "wo-0001", "run_id": "B",
+    "dies": [[0, 0], [-1, 1], [1, 1]]})
+order["local_pins"]            # 每种可行校准下都相同的那组本地坐标
+
+# 收件：恰好覆盖下发清单的 {at, bin} 行
+archive.receive_report("wo-0001", [
+    {"at": [0, 0], "bin": "P"},
+    {"at": [-1, 1], "bin": "F"},
+    {"at": [1, 1], "bin": "P"}])
+
+# 当前查询：按当前修订重新认定每份工单并融合选片图
+result = archive.current_result()
+result["revision_id"]          # 当前修订 ID
+result["work_orders"]          # 每份工单 scope_holds / reported
+result["effective_retests"]    # 生效复测行及其来源工单
+result["pick_coordinates"]     # 与 process_calibrated 同义的选片口径
+
+# 历史查询：原始工单与原始报告，不受后续认定影响
+archive.history_order("wo-0001")
+```
+
+同 ID 的建档、修订、签发与报告重放（集合/行顺序不计）均返回原回执，适合调用方丢失应答后重试；合成验收见 `tests/test_archive.py`（21 项），运行方式与其他测试一致：
+
+```sh
+.venv/bin/python -I -m unittest discover -s tests -v
+```
+
 ## 当前边界与来源
 
 不管理库存、订单、复测时间版本、自动设备控制或统计看板。
