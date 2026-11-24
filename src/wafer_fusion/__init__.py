@@ -5,6 +5,8 @@ from .exposure import compile_exposure_map
 from .archive import WaferArchive
 from .handoff import FirstTestLedger
 from .mounting import MountingBatch
+from .bin_catalog import compile_bin_catalog
 
 __all__ = ['process', 'process_calibrated', 'compile_exposure_map',
-           'WaferArchive', 'FirstTestLedger', 'MountingBatch']
+           'WaferArchive', 'FirstTestLedger', 'MountingBatch',
+           'compile_bin_catalog']

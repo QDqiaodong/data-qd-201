@@ -205,3 +205,49 @@ shot 矩形闭合；一个 shot 完整覆盖某裸片当且仅当裸片闭矩形
 ### 持久化、原子性与重放
 
 状态写入沿用档案口径：同目录临时文件 + `fsync` + 原子替换 + 目录 `fsync`，重开清理遗留临时文件。签发与配对锁定一起生效；终态确认、已耗用集合与装片位的终结/重新开放在同一次提交内一起生效。提交前中断后重开看不到半次变化；已完整提交但答复丢失时，凭原 `request_id`（领用）或原终态回执（报告）重放即可取回当时的凭据或确认。只支持一个调用方顺序操作，不提供通用 CLI、界面或设备连接。
+
+## 产品 bin 配方目录编译 API compile_bin_catalog
+
+`wafer_fusion.compile_bin_catalog(data)` 把一份产品 bin 配方目录编译成每个配方**确定的有效 code 目录**：下游据此知道某产品版本中的 code 最终表示 pass、fail、skip，还是经 alias 指向另一个规范 code；并保留每个有效定义来自哪些上游配方。纯标准库、离线，只处理配方目录，不接收/返回晶圆、run、测量记录或选片结果，不做持久化或界面，不修改调用方入参。任一配方出错都拒绝整份目录（即使它未被其他配方引用），不产生部分结果；所有失败均抛 `ValueError`。
+
+### 输入：配方目录
+
+顶层恰含 `recipes`，为 1～64 个配方。每个配方恰含 `id`、`parents`、`changes`。
+
+- `id` 沿用仓库 ASCII 标识约定（`[A-Za-z0-9_:-]{1,64}`），目录内唯一。
+- `parents` 为 0～8 个不重复的配方 ID；父项可在数组任意位置，但必须存在。全部配方组成 DAG；自继承与任意长度环均拒绝。数组顺序不是业务优先级。
+- `changes` 为 bin code 到定义的 JSON 对象，每配方最多 128 个 change。code 沿用同一 ASCII 标识约定。
+- 定义：
+  - 字符串 `"pass"` / `"fail"` / `"skip"`；
+  - 恰含 `alias` 字段的对象，值为 bin code（在同一有效目录内解析）；
+  - `null`：在当前配方中停用从父项继承的该 code。
+- 结构非法（未知字段、缺字段、非对象、类型不符）、重复 ID/code、未知父项、环、非法 disposition、无父来源的 `null`、未解决冲突、alias 悬空/成环/指向停用 code、以及规模越界，一律拒绝整份目录。
+
+规模：`recipes` 1～64；`parents` 0～8；每配方 `changes` ≤128；每配方有效 code ≤256。
+
+### 继承、覆盖与冲突
+
+对每个配方，先合并其直接父项的有效定义（父项在 DAG 中已先行编译）：
+
+- 一个父项没有某 code 不构成冲突。
+- 多个父项提供同一 code 且定义**完全相同**（同为相同 disposition，或同为结构相同、目标相同的 alias）时，合并为一项定义，来源为所有实际贡献该定义的父 recipe 的并集（沿路径传播的实际作者，去重）。
+- 定义不同则产生**待解决冲突**；当前配方必须显式给出新 disposition、alias 或 `null` 才能编译。未解决冲突时该配方无效，实现不得按 parents 顺序、字典序或遍历顺序挑选胜者。
+- 当前配方显式 change 替换父项带来的同 code 定义（含消解冲突）：
+  - 给出 disposition/alias 时，该 code 的直接定义来源归当前 recipe；alias 链终点定义的来源在解析时并入。
+  - 给出 `null` 时该 code 在当前配方中停用；仅当至少一个父项提供该 code 时合法，否则拒绝。
+- 停用只遮蔽当前配方的祖先继承，不影响兄弟或其他分支；被停用的 code 不出现在该配方的输出中。
+
+### alias 解析与来源
+
+完成全部祖先合并、本地 change 与冲突处理后再解析 alias。有效 alias 最终必须到达 disposition 定义：不得悬空、成环或指向停用 code。`canonical_code` 为 alias 链终点 code；`definition_sources` 为该 code 的 alias 链各节点定义与终点定义的全部来源 recipe ID 去重排序集合。多个父项拥有结构相同的 alias 定义时来源全部保留；alias 终点 code 由另一父项提供时其来源也纳入集合。
+
+### 输出
+
+返回 JSON 可序列化对象 `{"recipes": [...]}`，`recipes` 按 recipe ID 字典序排列。每项含 `id` 与按 code 字典序排列的 `codes`。每个有效 code 项含：
+
+- `code`：该配方中的有效 code（本配方 code 表中的键）；
+- `canonical_code`：alias 链终点 code（非 alias 时等于自身）；
+- `disposition`：终点定义的 `pass`/`fail`/`skip`；
+- `definition_sources`：alias 链各节点与终点定义的来源 recipe ID，去重、升序。
+
+输出只包含继承合成后的有效 code，不输出停用 code。输入 `recipes`、`parents`、`changes` 的顺序变化不改变有效定义、canonical code 或来源集合。

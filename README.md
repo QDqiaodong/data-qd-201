@@ -196,3 +196,34 @@ MountingBatch("run/mount-batch-7")          # 下一班重开：状态、凭据�
 ```sh
 .venv/bin/python -I -m unittest discover -s tests -v
 ```
+
+## 产品 bin 配方目录编译 API compile_bin_catalog
+
+多个产品共享企业级 bin 标准，再各自增加、覆盖或停用 code。`wafer_fusion.compile_bin_catalog(data)` 把一份配方目录编译为每个产品的有效 code 目录：每个 code 的规范终点、最终 `pass`/`fail`/`skip`，以及定义来自哪些上游配方。纯离线、标准库实现，只处理配方目录（不接晶圆、run、测量记录或选片结果，不做持久化或界面），不修改入参。
+
+```python
+from wafer_fusion import compile_bin_catalog
+
+result = compile_bin_catalog({
+    'recipes': [
+        {'id': 'base', 'parents': [],
+         'changes': {'P': 'pass', 'S': 'skip', 'A': {'alias': 'S'}}},
+        {'id': 'alpha', 'parents': ['base'], 'changes': {'P': 'fail'}},
+        {'id': 'beta', 'parents': ['base'], 'changes': {'P': None}},
+    ]})
+
+result['recipes'][0]   # first entry is 'alpha' (recipes sorted by id)
+# {'id': 'alpha', 'codes': [
+#     {'code': 'A', 'canonical_code': 'S', 'disposition': 'skip',
+#      'definition_sources': ['base']},
+#     {'code': 'P', 'canonical_code': 'P', 'disposition': 'fail',
+#      'definition_sources': ['alpha']},
+#     {'code': 'S', 'canonical_code': 'S', 'disposition': 'skip',
+#      'definition_sources': ['base']}]}
+```
+
+父配方组合顺序不改变语义：相同定义从多条路径汇入时来源取并集，不同定义必须由当前配方显式处置，停用只在当前配方遮蔽祖先继承。alias 在全部继承与冲突处理后解析，悬空、成环或指向停用 code 都会拒绝整份目录。规模上限与失败边界见 [数据契约](docs/contract.md)，合成验收见 `tests/test_bin_catalog.py`：
+
+```sh
+.venv/bin/python -I -m unittest discover -s tests -v
+```
